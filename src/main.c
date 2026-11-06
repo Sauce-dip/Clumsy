@@ -61,6 +61,11 @@ int stopKey = 117;  // Default: F6
 int startKeyModifiers = 0; // 0=none, 1=ctrl, 2=shift, 4=alt (can be combined)
 int stopKeyModifiers = 0;
 
+// hotkey runtime state
+static BOOL filtering = FALSE;   // TRUE while filtering is running (needed for toggle mode)
+static int captureTarget = 0;    // 0 = not rebinding, 1 = rebinding start key, 2 = rebinding stop key
+static Ihandle *startKeyButton, *stopKeyButton, *hotkeyModeLabel;
+
 // Mapping table for key names to virtual key codes
 typedef struct {
     const char* name;
@@ -344,11 +349,11 @@ void parseHotkey(const char* hotkeyStr, int* outVkCode, int* outModifiers) {
             continue;
         }
         
-        if (strcmp(token, "ctrl") == 0) {
+        if (_stricmp(token, "ctrl") == 0) {
             modifiers |= 1;
-        } else if (strcmp(token, "shift") == 0) {
+        } else if (_stricmp(token, "shift") == 0) {
             modifiers |= 2;
-        } else if (strcmp(token, "alt") == 0) {
+        } else if (_stricmp(token, "alt") == 0) {
             modifiers |= 4;
         } else {
             // Try to convert key name to virtual key code
@@ -378,6 +383,7 @@ void loadConfig() {
         size_t len;
         char *current, *last;
         len = fread(configBuf, sizeof(char), CONFIG_BUF_SIZE, f);
+        fclose(f); // was never closed, which blocked saveHotkeys() from replacing the file
         if (len == CONFIG_BUF_SIZE) {
             LOG("Config file is larger than %d bytes, get truncated.", CONFIG_BUF_SIZE);
         }
@@ -452,59 +458,214 @@ EAT_SPACE:  while (isspace(*current)) { ++current; }
     }
 }
 
-LRESULT CALLBACK LowLevelKeyboardProc( int nCode, WPARAM wParam, LPARAM lParam )
+// ---------------------------------------------------------------------------
+// hotkey handling
+// ---------------------------------------------------------------------------
+
+// start and stop bound to the exact same key combo means "toggle mode"
+static BOOL isSameBinding(void) {
+    return startKey == stopKey && startKeyModifiers == stopKeyModifiers;
+}
+
+static BOOL isModifierKey(int vk) {
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+           (vk >= VK_LSHIFT && vk <= VK_RMENU) ||
+           vk == VK_LWIN || vk == VK_RWIN;
+}
+
+// key code + modifier mask -> text like "ctrl+F5" (same format loadConfig reads)
+static void formatHotkey(int vk, int mods, char *out, size_t size) {
+    const char *name = NULL;
+    char fallback[16];
+    int i;
+    for (i = 0; keyMap[i].name != NULL; ++i) {
+        if (keyMap[i].vkCode == vk) { name = keyMap[i].name; break; }
+    }
+    if (!name) {
+        snprintf(fallback, sizeof(fallback), "0x%02X", vk);
+        name = fallback;
+    }
+    snprintf(out, size, "%s%s%s%s",
+        (mods & 1) ? "ctrl+" : "",
+        (mods & 2) ? "shift+" : "",
+        (mods & 4) ? "alt+" : "",
+        name);
+}
+
+static void refreshHotkeyUI(void) {
+    char keyText[48], title[80];
+
+    formatHotkey(startKey, startKeyModifiers, keyText, sizeof(keyText));
+    if (captureTarget == 1) snprintf(title, sizeof(title), "Start: ...");
+    else snprintf(title, sizeof(title), "Start: %s", keyText);
+    IupStoreAttribute(startKeyButton, "TITLE", title);
+
+    formatHotkey(stopKey, stopKeyModifiers, keyText, sizeof(keyText));
+    if (captureTarget == 2) snprintf(title, sizeof(title), "Stop: ...");
+    else snprintf(title, sizeof(title), "Stop: %s", keyText);
+    IupStoreAttribute(stopKeyButton, "TITLE", title);
+
+    IupSetAttribute(hotkeyModeLabel, "TITLE", isSameBinding() ? "(same key: toggles)" : "");
+}
+
+static BOOL getConfigPath(char *path, size_t size) {
+    char *p;
+    GetModuleFileNameA(NULL, path, (DWORD)size);
+    p = strrchr(path, '\\');
+    if (p == NULL) p = strrchr(path, '/');
+    if (p == NULL || (size_t)(p - path) + 1 + strlen(CONFIG_FILE) >= size) return FALSE;
+    strcpy(p + 1, CONFIG_FILE);
+    return TRUE;
+}
+
+// write start_key/stop_key into config.txt. Every other line (filters, comments)
+// is kept as is; only the old start_key/stop_key lines are replaced.
+static BOOL saveHotkeys(void) {
+    char path[MSG_BUFSIZE], tmpPath[MSG_BUFSIZE + 8];
+    char startText[48], stopText[48];
+    char *old = NULL, *line, *nl;
+    size_t oldLen = 0;
+    BOOL ok;
+    FILE *f, *out;
+
+    if (!getConfigPath(path, sizeof(path))) return FALSE;
+    snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+
+    f = fopen(path, "rb");
+    if (f) {
+        long size;
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (size > 0) {
+            old = (char*)malloc((size_t)size + 1);
+            if (!old) { fclose(f); return FALSE; } // don't risk clobbering the existing config
+            oldLen = fread(old, 1, (size_t)size, f);
+            old[oldLen] = '\0';
+        }
+        fclose(f);
+    }
+
+    out = fopen(tmpPath, "wb");
+    if (!out) { free(old); return FALSE; }
+
+    for (line = old; line && *line; line = nl ? nl + 1 : NULL) {
+        char *t = line;
+        nl = strchr(line, '\n');
+        while (*t == ' ' || *t == '\t') ++t;
+        if (strncmp(t, "start_key", 9) == 0 || strncmp(t, "stop_key", 8) == 0) continue;
+        fwrite(line, 1, nl ? (size_t)(nl - line + 1) : strlen(line), out);
+    }
+    if (oldLen > 0 && old[oldLen - 1] != '\n') fputc('\n', out);
+
+    formatHotkey(startKey, startKeyModifiers, startText, sizeof(startText));
+    formatHotkey(stopKey, stopKeyModifiers, stopText, sizeof(stopText));
+    fprintf(out, "start_key: %s\n", startText);
+    fprintf(out, "stop_key: %s\n", stopText);
+
+    ok = (ferror(out) == 0);
+    if (fclose(out) != 0) ok = FALSE;
+    free(old);
+    if (!ok) { DeleteFileA(tmpPath); return FALSE; }
+    if (MoveFileExA(tmpPath, path, MOVEFILE_REPLACE_EXISTING)) return TRUE;
+    // replace refused: try a plain overwrite instead
+    ok = CopyFileA(tmpPath, path, FALSE) ? TRUE : FALSE;
+    DeleteFileA(tmpPath);
+    return ok;
+}
+
+// "Start: ..." / "Stop: ..." button callbacks: next key combo pressed becomes the new hotkey
+static int uiStartKeyCb(Ihandle *ih) {
+    UNREFERENCED_PARAMETER(ih);
+    captureTarget = 1;
+    refreshHotkeyUI();
+    showStatus("Press the new start hotkey now (Esc cancels).");
+    return IUP_DEFAULT;
+}
+
+static int uiStopKeyCb(Ihandle *ih) {
+    UNREFERENCED_PARAMETER(ih);
+    captureTarget = 2;
+    refreshHotkeyUI();
+    showStatus("Press the new stop hotkey now (Esc cancels).");
+    return IUP_DEFAULT;
+}
+
+static void handleHotkeyCapture(int key, int mods) {
+    if (isModifierKey(key)) return; // wait for the real key, modifiers are read from key state
+
+    if (key == VK_ESCAPE && mods == 0) {
+        captureTarget = 0;
+        refreshHotkeyUI();
+        showStatus("Hotkey change cancelled.");
+        return;
+    }
+
+    if (captureTarget == 1) {
+        startKey = key;
+        startKeyModifiers = mods;
+    } else {
+        stopKey = key;
+        stopKeyModifiers = mods;
+    }
+    captureTarget = 0;
+    refreshHotkeyUI();
+
+    if (!saveHotkeys()) {
+        showStatus("Hotkey changed, but config.txt could not be saved.");
+    } else if (isSameBinding()) {
+        showStatus("Hotkey saved. Start and stop share one key, so it toggles.");
+    } else {
+        showStatus("Hotkey saved.");
+    }
+}
+
+static void handleHotkeyPress(int key, int mods) {
+    BOOL isStart = (key == startKey && mods == startKeyModifiers);
+    BOOL isStop = (key == stopKey && mods == stopKeyModifiers);
+
+    if (isStart && isStop) {
+        // same key for both: toggle
+        if (filtering) uiStopCb(NULL); else uiStartCb(NULL);
+    } else if (isStart) {
+        if (!filtering) uiStartCb(NULL);
+    } else if (isStop) {
+        if (filtering) uiStopCb(NULL);
+    }
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-   char pressedKey;
-   // Declare a pointer to the KBDLLHOOKSTRUCTdsad
-   KBDLLHOOKSTRUCT *pKeyBoard = (KBDLLHOOKSTRUCT *)lParam;
-   switch( wParam )
-   {
-       case WM_KEYUP: // When the key has been pressed and released
-       {
-          //get the key code
-          pressedKey = (char)pKeyBoard->vkCode;
-       }
-       break;
-       default:
-           return CallNextHookEx( NULL, nCode, wParam, lParam );
-       break;
-   }
+    // react when a key is released (WM_SYSKEYUP is what Alt+key combos send)
+    if (nCode == HC_ACTION && (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)) {
+        KBDLLHOOKSTRUCT *pKeyBoard = (KBDLLHOOKSTRUCT *)lParam;
+        int pressedKey = (int)pKeyBoard->vkCode;
+        int currentModifiers = 0;
 
-    // Get current modifier key states
-    int currentModifiers = 0;
-    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-        currentModifiers |= 1; // ctrl
-    }
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
-        currentModifiers |= 2; // shift
-    }
-    if (GetAsyncKeyState(VK_MENU) & 0x8000) {
-        currentModifiers |= 4; // alt
+        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) currentModifiers |= 1; // ctrl
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) currentModifiers |= 2;   // shift
+        if (GetAsyncKeyState(VK_MENU) & 0x8000) currentModifiers |= 4;    // alt
+
+        LOG("Key pressed: VK Code=%d (0x%02X), Modifiers=%d%s%s%s",
+            pressedKey, pressedKey, currentModifiers,
+            (currentModifiers & 1) ? " [Ctrl]" : "",
+            (currentModifiers & 2) ? " [Shift]" : "",
+            (currentModifiers & 4) ? " [Alt]" : "");
+
+        if (captureTarget != 0) {
+            handleHotkeyCapture(pressedKey, currentModifiers);
+        } else {
+            handleHotkeyPress(pressedKey, currentModifiers);
+        }
     }
 
-    // Check if pressed key matches start or stop key with correct modifiers
-    if (pressedKey == startKey && currentModifiers == startKeyModifiers)
-    {
-        uiStartCb(NULL);
-    } else if (pressedKey == stopKey && currentModifiers == stopKeyModifiers)
-    {
-        uiStopCb(NULL);
-    }
-    
-    // Log key press information (will output if show_console is enabled)
-    LOG("Key pressed: VK Code=%d (0x%02X), Modifiers=%d%s%s%s", 
-        pressedKey, pressedKey, currentModifiers,
-        (currentModifiers & 1) ? " [Ctrl]" : "",
-        (currentModifiers & 2) ? " [Shift]" : "",
-        (currentModifiers & 4) ? " [Alt]" : "");
-
-   //according to winapi all functions which implement a hook must return by calling next hook
-   return CallNextHookEx( NULL, nCode, wParam, lParam);
+    // according to winapi all functions which implement a hook must return by calling next hook
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
 void init(int argc, char* argv[]) {
     UINT ix;
-    Ihandle *topVbox, *bottomVbox, *dialogVBox, *controlHbox;
+    Ihandle *topVbox, *bottomVbox, *dialogVBox, *controlHbox, *hotkeyHbox;
     Ihandle *noneIcon, *doingIcon, *errorIcon;
     char* arg_value = NULL;
 
@@ -528,9 +689,15 @@ void init(int argc, char* argv[]) {
             controlHbox = IupHbox(
                 stateIcon = IupLabel(NULL),
                 filterButton = IupButton("Start", NULL),
-                IupFill(),
-                IupLabel("Presets:  "),
+                IupLabel("   Presets:  "),
                 filterSelectList = IupList(NULL),
+                NULL
+            ),
+            hotkeyHbox = IupHbox(
+                IupLabel("Hotkeys:  "),
+                startKeyButton = IupButton(NULL, NULL),
+                stopKeyButton = IupButton(NULL, NULL),
+                hotkeyModeLabel = IupLabel(NULL),
                 NULL
             ),
             NULL
@@ -559,6 +726,16 @@ void init(int argc, char* argv[]) {
     IupSetAttribute(topVbox, "NCGAP", "4x2");
     IupSetAttribute(controlHbox, "ALIGNMENT", "ACENTER");
 
+    // hotkey row: click a button, then press the new key combo
+    IupSetAttribute(hotkeyHbox, "ALIGNMENT", "ACENTER");
+    IupSetAttribute(hotkeyHbox, "NCGAP", "6");
+    IupSetAttribute(hotkeyModeLabel, "EXPAND", "HORIZONTAL");
+    IupSetAttribute(startKeyButton, "PADDING", "8x");
+    IupSetAttribute(stopKeyButton, "PADDING", "8x");
+    IupSetCallback(startKeyButton, "ACTION", uiStartKeyCb);
+    IupSetCallback(stopKeyButton, "ACTION", uiStopKeyCb);
+    refreshHotkeyUI();
+
     // setup state icon
     IupSetAttribute(stateIcon, "IMAGE", "none_icon");
     IupSetAttribute(stateIcon, "PADDING", "4x");
@@ -566,6 +743,7 @@ void init(int argc, char* argv[]) {
     // fill in options and setup callback
     IupSetAttribute(filterSelectList, "VISIBLECOLUMNS", "24");
     IupSetAttribute(filterSelectList, "DROPDOWN", "YES");
+    IupSetAttribute(filterSelectList, "EXPAND", "HORIZONTAL");
     for (ix = 0; ix < filtersSize; ++ix) {
         char ixBuf[4];
         sprintf(ixBuf, "%d", ix+1); // ! staring from 1, following lua indexing
@@ -763,6 +941,7 @@ static int uiStartCb(Ihandle *ih) {
     }
 
     // successfully started
+    filtering = TRUE;
     showStatus("Started filtering. Enable functionalities to take effect.");
     IupSetAttribute(filterText, "ACTIVE", "NO");
     IupSetAttribute(filterButton, "TITLE", "Stop");
@@ -780,6 +959,7 @@ static int uiStopCb(Ihandle *ih) {
     }
     
     // try stopping
+    filtering = FALSE;
     IupSetAttribute(filterButton, "ACTIVE", "NO");
     IupFlush(); // flush to show disabled state
     divertStop();
