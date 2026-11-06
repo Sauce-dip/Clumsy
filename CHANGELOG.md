@@ -34,3 +34,9 @@
 Based on [clumsy](https://github.com/jagt/clumsy) by jagt (MIT license) and the
 0.3 "with keybinds" version it builds on. All credit for the original work goes
 to their authors.
+
+
+## 0.4.1
+
+### Changed
+> Hotkeys now work while extra modifier keys are held
