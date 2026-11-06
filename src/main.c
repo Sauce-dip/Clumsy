@@ -620,9 +620,28 @@ static void handleHotkeyCapture(int key, int mods) {
     }
 }
 
+// a binding fires when its key is pressed and all of ITS modifiers are held.
+// Extra modifiers (e.g. holding Ctrl with a plain F5 binding) are ignored.
+static BOOL hotkeyMatches(int key, int mods, int wantKey, int wantMods) {
+    return key == wantKey && (mods & wantMods) == wantMods;
+}
+
+static int countModifiers(int mods) {
+    return (mods & 1) + ((mods >> 1) & 1) + ((mods >> 2) & 1);
+}
+
 static void handleHotkeyPress(int key, int mods) {
-    BOOL isStart = (key == startKey && mods == startKeyModifiers);
-    BOOL isStop = (key == stopKey && mods == stopKeyModifiers);
+    BOOL isStart = hotkeyMatches(key, mods, startKey, startKeyModifiers);
+    BOOL isStop = hotkeyMatches(key, mods, stopKey, stopKeyModifiers);
+
+    if (isStart && isStop && !isSameBinding()) {
+        // both match (e.g. F5 and ctrl+F5 are bound and Ctrl is held): the more specific one wins
+        int startBits = countModifiers(startKeyModifiers);
+        int stopBits = countModifiers(stopKeyModifiers);
+        if (startBits > stopBits) isStop = FALSE;
+        else if (stopBits > startBits) isStart = FALSE;
+        else return; // ambiguous, do nothing
+    }
 
     if (isStart && isStop) {
         // same key for both: toggle
