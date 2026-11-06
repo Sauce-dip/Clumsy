@@ -3,8 +3,8 @@
 #include "common.h"
 #define NAME "throttle"
 #define TIME_MIN "0"
-#define TIME_MAX "1000"
-#define TIME_DEFAULT 30
+#define TIME_MAX "10000"
+#define TIME_DEFAULT 1000
 // threshold for how many packet to throttle at most
 #define KEEP_AT_MOST 1000
 
