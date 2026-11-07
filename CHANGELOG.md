@@ -40,3 +40,10 @@ to their authors.
 
 ### Changed
 > Hotkeys now work while extra modifier keys are held
+
+## 0.4.2
+
+### Added
+- Ability to save presets inside the program itself
+- Program restores previous settings when reopening it
+- Taskbar icon changes when the program is actively filtering

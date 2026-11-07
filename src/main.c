@@ -41,6 +41,7 @@ static int uiTimeoutCb(Ihandle *ih);
 static int uiListSelectCb(Ihandle *ih, char *text, int item, int state);
 static int uiFilterTextCb(Ihandle *ih);
 static void uiSetupModule(Module *module, Ihandle *parent);
+static int uiToggleControls(Ihandle *ih, int state);
 
 // serializing config files using a stupid custom format
 #define CONFIG_FILE "config.txt"
@@ -65,6 +66,11 @@ int stopKeyModifiers = 0;
 static BOOL filtering = FALSE;   // TRUE while filtering is running (needed for toggle mode)
 static int captureTarget = 0;    // 0 = not rebinding, 1 = rebinding start key, 2 = rebinding stop key
 static Ihandle *startKeyButton, *stopKeyButton, *hotkeyModeLabel;
+
+// presets / saved state
+static BOOL hotkeysSuspended = FALSE;  // TRUE while a text prompt is open, so typing can't trigger hotkeys
+static Ihandle *savePresetButton;
+static Ihandle *moduleToggles[MODULE_CNT], *moduleControls[MODULE_CNT]; // filled in by uiSetupModule
 
 // Mapping table for key names to virtual key codes
 typedef struct {
@@ -508,14 +514,30 @@ static void refreshHotkeyUI(void) {
     IupSetAttribute(hotkeyModeLabel, "TITLE", isSameBinding() ? "(same key: toggles)" : "");
 }
 
-static BOOL getConfigPath(char *path, size_t size) {
+// swap the window/taskbar icon: active icon while filtering, normal icon otherwise
+static void setAppIcon(BOOL active) {
+    HWND hWnd = (HWND)IupGetAttribute(dialog, "HWND");
+    HICON icon;
+    if (!hWnd) return;
+    icon = LoadIcon(GetModuleHandle(NULL), active ? "CLUMSY_ICON_ACTIVE" : "CLUMSY_ICON");
+    if (!icon) return; // icon resource missing, keep whatever is showing
+    SendMessage(hWnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
+    SendMessage(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+}
+
+// full path of a file that lives next to the exe
+static BOOL getFilePath(const char *fileName, char *path, size_t size) {
     char *p;
     GetModuleFileNameA(NULL, path, (DWORD)size);
     p = strrchr(path, '\\');
     if (p == NULL) p = strrchr(path, '/');
-    if (p == NULL || (size_t)(p - path) + 1 + strlen(CONFIG_FILE) >= size) return FALSE;
-    strcpy(p + 1, CONFIG_FILE);
+    if (p == NULL || (size_t)(p - path) + 1 + strlen(fileName) >= size) return FALSE;
+    strcpy(p + 1, fileName);
     return TRUE;
+}
+
+static BOOL getConfigPath(char *path, size_t size) {
+    return getFilePath(CONFIG_FILE, path, size);
 }
 
 // write start_key/stop_key into config.txt. Every other line (filters, comments)
@@ -673,13 +695,485 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 
         if (captureTarget != 0) {
             handleHotkeyCapture(pressedKey, currentModifiers);
-        } else {
+        } else if (!hotkeysSuspended) {
             handleHotkeyPress(pressedKey, currentModifiers);
         }
     }
 
     // according to winapi all functions which implement a hook must return by calling next hook
     return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// presets and saved state
+//
+// A "state" is plain text, one key=value per line:
+//   filter=<filter text>
+//   start_key=ctrl+F5          (presets only)
+//   stop_key=F6                (presets only)
+//   <module>.on=1              module switched on or off
+//   <module>.<n>=<value>       value of the n:th control of that module
+// Saved presets live in presets.txt as "[name]" followed by such a block.
+// The latest state is written to last_state.txt and restored on startup.
+// ---------------------------------------------------------------------------
+#include <stdarg.h>
+
+#define PRESETS_FILE "presets.txt"
+#define LAST_STATE_FILE "last_state.txt"
+#define MAX_SAVED_PRESETS 64
+#define PRESET_NAME_MAX 64
+#define STATE_BUF_SIZE 8192
+// presets dropdown layout (iup list items start at 1):
+//   1 = "Last state", then the filter presets from config.txt, then presets saved in the app
+#define LAST_STATE_ITEM 1
+#define FIRST_FILTER_ITEM 2
+
+typedef struct {
+    char name[PRESET_NAME_MAX];
+    char *body; // the key=value lines
+} savedPreset;
+static savedPreset savedPresets[MAX_SAVED_PRESETS];
+static UINT savedPresetCount = 0;
+
+typedef int (*IstateCb)(Ihandle *ih, int state);
+
+static char *readWholeFile(const char *path) {
+    FILE *f = fopen(path, "rb");
+    long size;
+    char *data;
+    size_t got;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0 || size > 1024 * 1024) { fclose(f); return NULL; }
+    data = (char*)malloc((size_t)size + 1);
+    if (!data) { fclose(f); return NULL; }
+    got = fread(data, 1, (size_t)size, f);
+    data[got] = '\0';
+    fclose(f);
+    return data;
+}
+
+// write via a temp file so a crash can't leave a half written file behind
+static BOOL writeTextFile(const char *fileName, const char *text) {
+    char path[MSG_BUFSIZE], tmpPath[MSG_BUFSIZE + 8];
+    size_t len = strlen(text);
+    BOOL ok;
+    FILE *out;
+    if (!getFilePath(fileName, path, sizeof(path))) return FALSE;
+    snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+    out = fopen(tmpPath, "wb");
+    if (!out) return FALSE;
+    ok = (fwrite(text, 1, len, out) == len);
+    if (fclose(out) != 0) ok = FALSE;
+    if (!ok) { DeleteFileA(tmpPath); return FALSE; }
+    if (MoveFileExA(tmpPath, path, MOVEFILE_REPLACE_EXISTING)) return TRUE;
+    ok = CopyFileA(tmpPath, path, FALSE) ? TRUE : FALSE;
+    DeleteFileA(tmpPath);
+    return ok;
+}
+
+static void appendText(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
+    va_list args;
+    int n;
+    if (*len + 1 >= cap) return;
+    va_start(args, fmt);
+    n = vsnprintf(buf + *len, cap - *len, fmt, args);
+    va_end(args);
+    if (n < 0) return;
+    *len += ((size_t)n < cap - *len) ? (size_t)n : (cap - *len - 1);
+}
+
+// copy a value, turning line breaks into spaces so one value always stays on one line
+static void cleanValue(const char *in, char *out, size_t size) {
+    size_t n = 0;
+    if (in) {
+        for (; *in && n + 1 < size; ++in) {
+            out[n++] = (*in == '\r' || *in == '\n') ? ' ' : *in;
+        }
+    }
+    out[n] = '\0';
+}
+
+static int findModuleIndex(const char *shortName) {
+    int ix;
+    for (ix = 0; ix < MODULE_CNT; ++ix) {
+        if (strcmp(modules[ix]->shortName, shortName) == 0) return ix;
+    }
+    return -1;
+}
+
+// current UI -> text
+static void buildStateText(char *buf, size_t cap, BOOL withHotkeys) {
+    size_t len = 0;
+    char value[FILTER_BUFSIZE + 1];
+    char startText[48], stopText[48];
+    int ix, pos;
+
+    buf[0] = '\0';
+    cleanValue(IupGetAttribute(filterText, "VALUE"), value, sizeof(value));
+    appendText(buf, cap, &len, "filter=%s\n", value);
+    if (withHotkeys) {
+        formatHotkey(startKey, startKeyModifiers, startText, sizeof(startText));
+        formatHotkey(stopKey, stopKeyModifiers, stopText, sizeof(stopText));
+        appendText(buf, cap, &len, "start_key=%s\nstop_key=%s\n", startText, stopText);
+    }
+    for (ix = 0; ix < MODULE_CNT; ++ix) {
+        Ihandle *child;
+        if (!moduleToggles[ix] || !moduleControls[ix]) continue;
+        appendText(buf, cap, &len, "%s.on=%d\n", modules[ix]->shortName,
+            IupGetInt(moduleToggles[ix], "VALUE") ? 1 : 0);
+        for (pos = 0; (child = IupGetChild(moduleControls[ix], pos)) != NULL; ++pos) {
+            // only toggles and text boxes carry a SYNCED_VALUE, labels and buttons are skipped
+            if (!IupGetAttribute(child, SYNCED_VALUE)) continue;
+            cleanValue(IupGetAttribute(child, "VALUE"), value, 64);
+            appendText(buf, cap, &len, "%s.%d=%s\n", modules[ix]->shortName, pos, value);
+        }
+    }
+}
+
+// set a control's value AND run its callback, so the value the packet code reads is updated too
+// (iup doesn't call callbacks when an attribute is set from code; same trick as setFromParameter)
+static void restoreControl(Ihandle *ih, const char *value) {
+    Icallback cb;
+    IstateCb scb;
+    IupStoreAttribute(ih, "VALUE", value);
+    cb = IupGetCallback(ih, "VALUECHANGED_CB");
+    if (cb) {
+        cb(ih);
+        return;
+    }
+    scb = (IstateCb)IupGetCallback(ih, "ACTION");
+    if (scb) scb(ih, IupGetInt(ih, "VALUE"));
+}
+
+// text -> UI
+static void applyStateText(const char *body, BOOL withHotkeys) {
+    const char *line = body;
+    BOOL hotkeysChanged = FALSE;
+    char lineBuf[FILTER_BUFSIZE + 64];
+
+    while (line && *line) {
+        const char *nl = strchr(line, '\n');
+        size_t n = nl ? (size_t)(nl - line) : strlen(line);
+        char *key, *value, *dot;
+
+        if (n >= sizeof(lineBuf)) n = sizeof(lineBuf) - 1;
+        memcpy(lineBuf, line, n);
+        lineBuf[n] = '\0';
+        if (n > 0 && lineBuf[n - 1] == '\r') lineBuf[n - 1] = '\0';
+        line = nl ? nl + 1 : NULL;
+
+        key = lineBuf;
+        value = strchr(lineBuf, '=');
+        if (!value) continue;
+        *value++ = '\0';
+
+        if (strcmp(key, "filter") == 0) {
+            // the filter can't change while filtering is running
+            if (!filtering) IupStoreAttribute(filterText, "VALUE", value);
+        } else if (strcmp(key, "start_key") == 0 || strcmp(key, "stop_key") == 0) {
+            int vk = 0, mods = 0;
+            if (!withHotkeys) continue;
+            parseHotkey(value, &vk, &mods);
+            if (vk == 0) continue; // unknown key name, keep the current binding
+            if (strcmp(key, "start_key") == 0) {
+                if (startKey != vk || startKeyModifiers != mods) hotkeysChanged = TRUE;
+                startKey = vk;
+                startKeyModifiers = mods;
+            } else {
+                if (stopKey != vk || stopKeyModifiers != mods) hotkeysChanged = TRUE;
+                stopKey = vk;
+                stopKeyModifiers = mods;
+            }
+        } else if ((dot = strchr(key, '.')) != NULL) {
+            int ix;
+            const char *sub = dot + 1;
+            *dot = '\0';
+            ix = findModuleIndex(key);
+            if (ix < 0 || !moduleToggles[ix] || !moduleControls[ix]) continue;
+            if (strcmp(sub, "on") == 0) {
+                int on = atoi(value) ? 1 : 0;
+                IupSetAttribute(moduleToggles[ix], "VALUE", on ? "ON" : "OFF");
+                uiToggleControls(moduleToggles[ix], on);
+            } else if (sub[0] >= '0' && sub[0] <= '9') {
+                Ihandle *child = IupGetChild(moduleControls[ix], atoi(sub));
+                if (child && IupGetAttribute(child, SYNCED_VALUE)) restoreControl(child, value);
+            }
+        }
+    }
+
+    if (hotkeysChanged) {
+        refreshHotkeyUI();
+        saveHotkeys(); // keep config.txt in step with the bindings in use
+    }
+}
+
+// ---- last_state.txt ----
+
+static void autosaveState(void) {
+    char *buf;
+    if (parameterized) return; // started with command line options, leave the saved state alone
+    buf = (char*)malloc(STATE_BUF_SIZE);
+    if (!buf) return;
+    buildStateText(buf, STATE_BUF_SIZE, FALSE); // hotkeys already persist through config.txt
+    writeTextFile(LAST_STATE_FILE, buf);
+    free(buf);
+}
+
+// read last_state.txt and apply it. returns FALSE if there is no saved state yet
+static BOOL applyLastStateFile(void) {
+    char path[MSG_BUFSIZE];
+    char *data;
+
+    if (!getFilePath(LAST_STATE_FILE, path, sizeof(path))) return FALSE;
+    data = readWholeFile(path);
+    if (!data) return FALSE;
+    applyStateText(data, FALSE);
+    free(data);
+    return TRUE;
+}
+
+static void loadLastState(void) {
+    // show "Last state" in the presets dropdown so it's clear where the settings came from
+    if (applyLastStateFile()) {
+        IupSetAttribute(filterSelectList, "VALUE", "1");
+    }
+}
+
+static int uiDialogCloseCb(Ihandle *ih) {
+    UNREFERENCED_PARAMETER(ih);
+    autosaveState();
+    return IUP_DEFAULT;
+}
+
+// ---- presets.txt ----
+
+static char *copyRange(const char *from, const char *to) {
+    size_t n = (to > from) ? (size_t)(to - from) : 0;
+    char *copy = (char*)malloc(n + 1);
+    if (!copy) return NULL;
+    memcpy(copy, from, n);
+    copy[n] = '\0';
+    return copy;
+}
+
+static void loadPresetsFile(void) {
+    char path[MSG_BUFSIZE];
+    char *data, *line, *bodyStart = NULL;
+    int cur = -1;
+
+    if (!getFilePath(PRESETS_FILE, path, sizeof(path))) return;
+    data = readWholeFile(path);
+    if (!data) return;
+
+    line = data;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        char *next = nl ? nl + 1 : NULL;
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        size_t end = len;
+        while (end > 0 && (line[end - 1] == '\r' || line[end - 1] == ' ')) --end;
+
+        if (line[0] == '[' && end >= 2 && line[end - 1] == ']') {
+            size_t n = end - 2;
+            // a new header closes the previous preset's body
+            if (cur >= 0 && bodyStart) savedPresets[cur].body = copyRange(bodyStart, line);
+            if (savedPresetCount < MAX_SAVED_PRESETS) {
+                cur = (int)savedPresetCount++;
+                if (n >= PRESET_NAME_MAX) n = PRESET_NAME_MAX - 1;
+                memcpy(savedPresets[cur].name, line + 1, n);
+                savedPresets[cur].name[n] = '\0';
+                savedPresets[cur].body = NULL;
+            } else {
+                cur = -1;
+            }
+            bodyStart = next ? next : line + len;
+        }
+        line = next;
+    }
+    if (cur >= 0 && bodyStart) savedPresets[cur].body = copyRange(bodyStart, data + strlen(data));
+
+    // drop presets whose body couldn't be read
+    {
+        UINT ix, keep = 0;
+        for (ix = 0; ix < savedPresetCount; ++ix) {
+            if (!savedPresets[ix].body) continue;
+            if (keep != ix) savedPresets[keep] = savedPresets[ix];
+            ++keep;
+        }
+        savedPresetCount = keep;
+    }
+    free(data);
+}
+
+static BOOL writePresetsFile(void) {
+    size_t total = 1;
+    UINT ix;
+    char *out, *p;
+    BOOL ok;
+
+    for (ix = 0; ix < savedPresetCount; ++ix) {
+        total += strlen(savedPresets[ix].name) + strlen(savedPresets[ix].body) + 8;
+    }
+    out = (char*)malloc(total);
+    if (!out) return FALSE;
+    p = out;
+    for (ix = 0; ix < savedPresetCount; ++ix) {
+        p += sprintf(p, "[%s]\n%s", savedPresets[ix].name, savedPresets[ix].body);
+        if (p > out && p[-1] != '\n') *p++ = '\n';
+        *p++ = '\n';
+    }
+    *p = '\0';
+    ok = writeTextFile(PRESETS_FILE, out);
+    free(out);
+    return ok;
+}
+
+// names go between [ ] in the file, so keep them to one line and without brackets
+static void sanitizePresetName(const char *in, char *out, size_t size) {
+    size_t n = 0;
+    while (*in == ' ' || *in == '\t') ++in;
+    for (; *in && n + 1 < size; ++in) {
+        unsigned char c = (unsigned char)*in;
+        if (c < 0x20) continue;
+        out[n++] = (c == '[') ? '(' : (c == ']') ? ')' : (char)c;
+    }
+    while (n > 0 && out[n - 1] == ' ') --n;
+    out[n] = '\0';
+}
+
+// add a preset, or overwrite the one with the same name. returns its index, -1 if full
+static int storePreset(const char *name, const char *body) {
+    UINT ix;
+    char *copy = copyRange(body, body + strlen(body));
+    if (!copy) return -1;
+    for (ix = 0; ix < savedPresetCount; ++ix) {
+        if (_stricmp(savedPresets[ix].name, name) == 0) {
+            free(savedPresets[ix].body);
+            savedPresets[ix].body = copy;
+            return (int)ix;
+        }
+    }
+    if (savedPresetCount >= MAX_SAVED_PRESETS) {
+        free(copy);
+        return -1;
+    }
+    strncpy(savedPresets[savedPresetCount].name, name, PRESET_NAME_MAX - 1);
+    savedPresets[savedPresetCount].name[PRESET_NAME_MAX - 1] = '\0';
+    savedPresets[savedPresetCount].body = copy;
+    return (int)savedPresetCount++;
+}
+
+static void applyPreset(UINT idx) {
+    char msg[MSG_BUFSIZE];
+    applyStateText(savedPresets[idx].body, TRUE);
+    snprintf(msg, sizeof(msg), "Loaded preset \"%s\".%s", savedPresets[idx].name,
+        filtering ? " (The filter text can't change while filtering is running.)" : "");
+    showStatus(msg);
+    autosaveState();
+}
+
+// ---- "Save preset" button and its name prompt ----
+
+static BOOL promptAccepted = FALSE;
+
+static int namePromptOkCb(Ihandle *ih) {
+    promptAccepted = TRUE;
+    IupHide(IupGetDialog(ih));
+    return IUP_DEFAULT;
+}
+
+static int namePromptCancelCb(Ihandle *ih) {
+    IupHide(IupGetDialog(ih));
+    return IUP_DEFAULT;
+}
+
+static BOOL promptPresetName(char *out, size_t size) {
+    Ihandle *text, *okButton, *cancelButton, *dlg, *vbox, *buttons;
+
+    promptAccepted = FALSE;
+    out[0] = '\0';
+    text = IupText(NULL);
+    okButton = IupButton("Save", NULL);
+    cancelButton = IupButton("Cancel", NULL);
+    dlg = IupDialog(
+        vbox = IupVbox(
+            IupLabel("Name for the preset:"),
+            text,
+            buttons = IupHbox(IupFill(), okButton, cancelButton, NULL),
+            NULL
+        )
+    );
+    IupSetAttribute(text, "VISIBLECOLUMNS", "28");
+    IupSetAttribute(text, "EXPAND", "HORIZONTAL");
+    IupSetAttribute(okButton, "PADDING", "12x");
+    IupSetAttribute(cancelButton, "PADDING", "12x");
+    IupSetCallback(okButton, "ACTION", namePromptOkCb);
+    IupSetCallback(cancelButton, "ACTION", namePromptCancelCb);
+    IupSetAttribute(vbox, "NCMARGIN", "8x8");
+    IupSetAttribute(vbox, "NCGAP", "6");
+    IupSetAttribute(buttons, "NCGAP", "6");
+    IupSetAttribute(dlg, "TITLE", "Save preset");
+    IupSetAttribute(dlg, "RESIZE", "NO");
+    IupSetAttribute(dlg, "MINBOX", "NO");
+    IupSetAttribute(dlg, "MAXBOX", "NO");
+    IupSetAttributeHandle(dlg, "DEFAULTENTER", okButton);
+    IupSetAttributeHandle(dlg, "DEFAULTESC", cancelButton);
+    IupSetAttributeHandle(dlg, "PARENTDIALOG", dialog);
+
+    hotkeysSuspended = TRUE; // keys typed into the name must not start/stop filtering
+    IupPopup(dlg, IUP_CENTER, IUP_CENTER);
+    hotkeysSuspended = FALSE;
+
+    if (promptAccepted) cleanValue(IupGetAttribute(text, "VALUE"), out, size);
+    IupDestroy(dlg);
+    return promptAccepted;
+}
+
+static int uiSavePresetCb(Ihandle *ih) {
+    char rawName[PRESET_NAME_MAX * 2], name[PRESET_NAME_MAX];
+    char msg[MSG_BUFSIZE], idxBuf[16];
+    char *body;
+    UINT countBefore;
+    int idx;
+    BOOL written;
+
+    UNREFERENCED_PARAMETER(ih);
+    if (!promptPresetName(rawName, sizeof(rawName))) return IUP_DEFAULT;
+    sanitizePresetName(rawName, name, sizeof(name));
+    if (name[0] == '\0') {
+        showStatus("Preset not saved: the name was empty.");
+        return IUP_DEFAULT;
+    }
+
+    body = (char*)malloc(STATE_BUF_SIZE);
+    if (!body) return IUP_DEFAULT;
+    buildStateText(body, STATE_BUF_SIZE, TRUE);
+    countBefore = savedPresetCount;
+    idx = storePreset(name, body);
+    free(body);
+    if (idx < 0) {
+        showStatus("Preset not saved: too many saved presets.");
+        return IUP_DEFAULT;
+    }
+
+    written = writePresetsFile();
+    if (savedPresetCount > countBefore) {
+        IupStoreAttribute(filterSelectList, "APPENDITEM", savedPresets[idx].name);
+    }
+    sprintf(idxBuf, "%u", filtersSize + (UINT)idx + FIRST_FILTER_ITEM);
+    IupStoreAttribute(filterSelectList, "VALUE", idxBuf);
+
+    if (written) {
+        snprintf(msg, sizeof(msg), "Saved preset \"%s\".", savedPresets[idx].name);
+    } else {
+        snprintf(msg, sizeof(msg), "Preset \"%s\" is in the list, but presets.txt could not be written.",
+            savedPresets[idx].name);
+    }
+    showStatus(msg);
+    return IUP_DEFAULT;
 }
 
 void init(int argc, char* argv[]) {
@@ -710,6 +1204,7 @@ void init(int argc, char* argv[]) {
                 filterButton = IupButton("Start", NULL),
                 IupLabel("   Presets:  "),
                 filterSelectList = IupList(NULL),
+                savePresetButton = IupButton("Save preset", NULL),
                 NULL
             ),
             hotkeyHbox = IupHbox(
@@ -763,12 +1258,22 @@ void init(int argc, char* argv[]) {
     IupSetAttribute(filterSelectList, "VISIBLECOLUMNS", "24");
     IupSetAttribute(filterSelectList, "DROPDOWN", "YES");
     IupSetAttribute(filterSelectList, "EXPAND", "HORIZONTAL");
+    IupSetAttribute(filterSelectList, "1", "Last state");
     for (ix = 0; ix < filtersSize; ++ix) {
-        char ixBuf[4];
-        sprintf(ixBuf, "%d", ix+1); // ! staring from 1, following lua indexing
+        char ixBuf[16];
+        sprintf(ixBuf, "%d", ix + FIRST_FILTER_ITEM); // ! staring from 1, following lua indexing
         IupStoreAttribute(filterSelectList, ixBuf, filters[ix].filterName);
     }
-    IupSetAttribute(filterSelectList, "VALUE", "1");
+    // presets saved from the app come after the filter-only presets from config.txt
+    loadPresetsFile();
+    for (ix = 0; ix < savedPresetCount; ++ix) {
+        char ixBuf[16];
+        sprintf(ixBuf, "%u", filtersSize + ix + FIRST_FILTER_ITEM);
+        IupStoreAttribute(filterSelectList, ixBuf, savedPresets[ix].name);
+    }
+    IupSetAttribute(savePresetButton, "PADDING", "8x");
+    IupSetCallback(savePresetButton, "ACTION", uiSavePresetCb);
+    IupSetAttribute(filterSelectList, "VALUE", "2"); // first filter preset, replaced by "Last state" if one gets restored
     IupSetCallback(filterSelectList, "ACTION", (Icallback)uiListSelectCb);
     // set filter text value since the callback won't take effect before main loop starts
     IupSetAttribute(filterText, "VALUE", filters[0].filterValue);
@@ -802,6 +1307,11 @@ void init(int argc, char* argv[]) {
         uiSetupModule(*(modules+ix), bottomVbox);
     }
 
+    // restore what the program looked like last time it was closed
+    if (!parameterized) {
+        loadLastState();
+    }
+
     // dialog
     dialog = IupDialog(
         dialogVBox = IupVbox(
@@ -816,6 +1326,7 @@ void init(int argc, char* argv[]) {
     IupSetAttribute(dialog, "SIZE", "480x"); // add padding manually to width
     IupSetAttribute(dialog, "RESIZE", "NO");
     IupSetCallback(dialog, "SHOW_CB", (Icallback)uiOnDialogShow);
+    IupSetCallback(dialog, "CLOSE_CB", (Icallback)uiDialogCloseCb);
 
 
     // global layout settings to affect childrens
@@ -961,11 +1472,13 @@ static int uiStartCb(Ihandle *ih) {
 
     // successfully started
     filtering = TRUE;
+    setAppIcon(TRUE);
     showStatus("Started filtering. Enable functionalities to take effect.");
     IupSetAttribute(filterText, "ACTIVE", "NO");
     IupSetAttribute(filterButton, "TITLE", "Stop");
     IupSetCallback(filterButton, "ACTION", uiStopCb);
     IupSetAttribute(timer, "RUN", "YES");
+    autosaveState();
 
     return IUP_DEFAULT;
 }
@@ -979,6 +1492,7 @@ static int uiStopCb(Ihandle *ih) {
     
     // try stopping
     filtering = FALSE;
+    setAppIcon(FALSE);
     IupSetAttribute(filterButton, "ACTIVE", "NO");
     IupFlush(); // flush to show disabled state
     divertStop();
@@ -998,6 +1512,7 @@ static int uiStopCb(Ihandle *ih) {
     IupSetAttribute(stateIcon, "IMAGE", "none_icon");
 
     showStatus("Stopped. To begin again, edit criteria and click Start.");
+    autosaveState();
     return IUP_DEFAULT;
 }
 
@@ -1056,7 +1571,18 @@ static int uiListSelectCb(Ihandle *ih, char *text, int item, int state) {
     UNREFERENCED_PARAMETER(text);
     UNREFERENCED_PARAMETER(ih);
     if (state == 1) {
-        IupSetAttribute(filterText, "VALUE", filters[item-1].filterValue);
+        if (item == LAST_STATE_ITEM) {
+            // go back to the state saved at the last start, stop, preset load or exit
+            if (applyLastStateFile()) {
+                showStatus("Restored the last saved state.");
+            } else {
+                showStatus("No saved state yet. It is saved when you start, stop or close the program.");
+            }
+        } else if ((UINT)(item - FIRST_FILTER_ITEM) < filtersSize) {
+            IupSetAttribute(filterText, "VALUE", filters[item - FIRST_FILTER_ITEM].filterValue);
+        } else if ((UINT)(item - FIRST_FILTER_ITEM) - filtersSize < savedPresetCount) {
+            applyPreset((UINT)(item - FIRST_FILTER_ITEM) - filtersSize);
+        }
     }
     return IUP_DEFAULT;
 }
@@ -1070,6 +1596,7 @@ static int uiFilterTextCb(Ihandle *ih)  {
 
 static void uiSetupModule(Module *module, Ihandle *parent) {
     Ihandle *groupBox, *toggle, *controls, *icon;
+    int ix;
     groupBox = IupHbox(
         icon = IupLabel(NULL),
         toggle = IupToggle(module->displayName, NULL),
@@ -1093,6 +1620,15 @@ static void uiSetupModule(Module *module, Ihandle *parent) {
     IupSetAttribute(icon, "IMAGE", "none_icon");
     IupSetAttribute(icon, "PADDING", "4x");
     module->iconHandle = icon;
+
+    // remember the handles so presets can read and restore this module's settings
+    for (ix = 0; ix < MODULE_CNT; ++ix) {
+        if (modules[ix] == module) {
+            moduleToggles[ix] = toggle;
+            moduleControls[ix] = controls;
+            break;
+        }
+    }
 
     // parameterize toggle
     if (parameterized) {

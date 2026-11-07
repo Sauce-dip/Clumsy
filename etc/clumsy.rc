@@ -1,4 +1,5 @@
 CLUMSY_ICON ICON "clumsy-icon.ico"  /* the first icon will also defines the executable icon in Explorer */
+CLUMSY_ICON_ACTIVE ICON "clumsy-icon-active.ico" /* the icon that will be used when the program is started */
 
 /****************************************************/
 /* Used by IupFileDlg when SHOWPREVIEW=Yes */
